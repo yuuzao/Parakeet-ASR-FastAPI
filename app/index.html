@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Audio Transcription</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; line-height: 1.5; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { margin-top: 0; }
+    #segments { padding: 1em; background: #f4f4f4; border: 1px solid #ccc; max-height: 400px; overflow-y: auto; margin-top:10px; }
+    .segment { margin-bottom: 0.5em; padding: 4px; border-bottom: 1px dotted #eee; }
+    .segment:last-child { border-bottom: none; }
+    #progress { width: 100%; height: 20px; margin-top: 10px; display: none; }
+    .status { padding: 8px; margin: 8px 0; background: #e9f5ff; border-radius: 4px; }
+    #debug { background: #ffe; padding: 10px; border: 1px solid #ccc; max-height: 200px; overflow: auto; white-space: pre-wrap; font-family: monospace; font-size: 12px; margin-top: 20px; display: none; }
+    .warning { background: #ffeeee; color: #990000; }
+    .success { background: #effff0; color: #006600; }
+    .info { background: #e9f5ff; color: #00529B; }
+    .controls { margin: 16px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;}
+    button { padding: 8px 16px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    select, input[type="file"] { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    #result { background:#f8f8f8; padding:1em; border:1px solid #ccc; max-height:300px; overflow:auto; white-space:pre-wrap; border-radius: 4px; margin-top:10px;}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>NeMo parakeet Audio Transcription</h1>
+    
+    <div class="controls">
+      <input type="file" id="audioFile" accept="audio/*" />
+      <select id="mode">
+        <option value="rest">REST API (File Upload)</option>
+        <option value="ws">WebSocket (Full File Decode)</option>
+      </select>
+      <button id="transcribeButton" onclick="transcribe()">Transcribe</button>
+      <div>
+        <input type="checkbox" id="enableDebug" onchange="toggleDebug()" /> <label for="enableDebug">Debug mode</label>
+      </div>
+    </div>
+    
+    <progress id="progress" value="0" max="100"></progress>
+    <div id="statusBox" class="status" style="display: none;"></div>
+
+    <h3>Transcription Time: <span id="time">N/A</span></h3>
+    <h3>Time to First Segment: <span id="timeToFirstSegment">N/A</span></h3>
+
+    <h3>Final Transcription Text:</h3>
+    <div id="result">No transcription yet.</div>
+
+    <h3>Streaming Segments:</h3>
+    <div id="segments">No segments received yet.</div>
+    
+    <div id="debug"></div>
+  </div>
+
+  <script>
+    const CLIENT_UPLOAD_CHUNK_SIZE = 1024 * 256;
+
+    const debugBox = document.getElementById("debug");
+    const resultBox = document.getElementById("result");
+    const timeBox = document.getElementById("time");
+    const timeToFirstSegmentBox = document.getElementById("timeToFirstSegment"); // Get the new span
+    const segmentsBox = document.getElementById("segments");
+    const progressBar = document.getElementById("progress");
+    const statusBox = document.getElementById("statusBox");
+    const transcribeButton = document.getElementById("transcribeButton");
+    
+    let currentWebSocket = null;
+    let watchdogInterval = null;
+    let transcriptionStartTime = 0; // To store when transcription process starts
+    let firstSegmentReceived = false; // Flag for WebSocket
+
+    // Get base URL to handle both local development and deployed environments
+    const getBaseUrl = () => {
+      return window.location.href.split('/').slice(0, 3).join('/');
+    };
+
+    function toggleDebug() { /* ... (no change) ... */ 
+      const debugEnabled = document.getElementById("enableDebug").checked;
+      debugBox.style.display = debugEnabled ? "block" : "none";
+      if (debugEnabled) logDebug("Debug mode enabled.");
+    }
+    
+    function logDebug(message, obj) { /* ... (no change) ... */ 
+      if (debugBox.style.display === "block") {
+        const timestamp = new Date().toLocaleTimeString();
+        let logMsg = `[${timestamp}] ${message}`;
+        if (obj !== undefined) {
+          try {logMsg += ": " + JSON.stringify(obj, null, 2);}
+          catch (e) {logMsg += ": [Unserializable Object]";}
+        }
+        const logElement = document.createElement("div");
+        logElement.textContent = logMsg;
+        debugBox.appendChild(logElement);
+        debugBox.scrollTop = debugBox.scrollHeight;
+      }
+    }
+    
+    function updateStatus(message, type = "info") { /* ... (no change) ... */ 
+      statusBox.style.display = "block";
+      statusBox.textContent = message;
+      statusBox.className = 'status'; 
+      if (type) statusBox.classList.add(type);
+      logDebug(`Status Update (${type}): ${message}`);
+    }
+
+    function resetUI() {
+        resultBox.textContent = "No transcription yet.";
+        timeBox.textContent = "N/A";
+        timeToFirstSegmentBox.textContent = "N/A"; // Reset new field
+        segmentsBox.innerHTML = "No segments received yet.";
+        if (!document.getElementById("enableDebug").checked) {debugBox.innerHTML = "";}
+        progressBar.style.display = "none"; progressBar.value = 0;
+        statusBox.style.display = "none";
+        transcribeButton.disabled = false;
+        firstSegmentReceived = false; // Reset flag for WS
+    }
+    
+    async function transcribe() {
+      resetUI();
+      const fileInput = document.getElementById("audioFile");
+      const mode = document.getElementById("mode").value;
+
+      if (!fileInput.files.length) {
+        updateStatus("Please select an audio file.", "warning"); return;
+      }
+
+      const file = fileInput.files[0];
+      logDebug(`File selected: ${file.name}, size: ${(file.size / (1024 * 1024)).toFixed(2)}MB, type: ${file.type}`);
+      transcribeButton.disabled = true;
+      
+      transcriptionStartTime = performance.now(); // Record start time
+
+      if (mode === "rest") {
+        await processWithREST(file);
+      } else if (mode === "ws") {
+        await processWithWebSocket(file);
+      }
+    }
+    
+    async function processWithREST(file) {
+      const formData = new FormData();
+      formData.append("file", file);
+      // `transcriptionStartTime` is already set in `transcribe()`
+      
+      progressBar.style.display = "block"; progressBar.value = 0; 
+      updateStatus("Uploading and processing file (REST)...", "info");
+      let progressVal = 0;
+      const pseudoProgress = setInterval(() => {
+        progressVal = Math.min(95, progressVal + 5); progressBar.value = progressVal;
+      }, 200);
+
+      try {
+        const res = await fetch(`${getBaseUrl()}/v1/audio/transcriptions`, {method: "POST", body: formData});
+        clearInterval(pseudoProgress); progressBar.value = 100;
+        
+        // For REST, total processing time is when we get the response
+        const processingEndTime = performance.now();
+        const totalDurationSeconds = ((processingEndTime - transcriptionStartTime) / 1000).toFixed(2);
+        
+        if (!res.ok) {
+            const errorData = await res.json().catch(() => ({ detail: "Unknown server error" }));
+            throw new Error(`Server error: ${res.status} - ${errorData.detail || res.statusText}`);
+        }
+        
+        const json = await res.json();
+        // Use server's transcription_time if available, otherwise use client-measured total duration
+        timeBox.textContent = `${json.transcription_time || totalDurationSeconds} seconds`; 
+        // For REST, time to first segment is the same as total transcription time
+        timeToFirstSegmentBox.textContent = `${json.transcription_time || totalDurationSeconds} seconds`; 
+
+        resultBox.textContent = json.text || "No transcription text returned.";
+        segmentsBox.innerHTML = ""; 
+        if (json.segments && json.segments.length) {
+          json.segments.forEach(seg => {
+            const el = document.createElement("div"); el.className = "segment";
+            el.textContent = `[${seg.start.toFixed(2)}s - ${seg.end.toFixed(2)}s] ${seg.text}`;
+            segmentsBox.appendChild(el);
+          });
+          updateStatus(`REST: Transcription complete with ${json.segments.length} segments!`, "success");
+        } else {
+          updateStatus("REST: Transcription complete, but no segments were returned.", "info");
+        }
+      } catch (err) {
+        console.error("REST Error:", err); resultBox.textContent = "Error: " + err.message;
+        updateStatus("REST Error: " + err.message, "warning"); clearInterval(pseudoProgress); 
+      } finally {
+        progressBar.style.display = "none"; transcribeButton.disabled = false;
+      }
+    }
+    
+    async function processWithWebSocket(file) {
+      progressBar.style.display = "block"; progressBar.value = 0;
+      // `transcriptionStartTime` is already set in `transcribe()`
+      firstSegmentReceived = false; // Reset for this new WS connection
+      
+      let receivedSegmentsCount = 0; let lastMessageTime = Date.now();
+      let uploadStreamCompleted = false; segmentsBox.innerHTML = ""; 
+      let audioSampleRate = 16000; let audioChannels = 1;       
+      try { /* ... (audio context for sample rate - no change) ... */ 
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const arrayBuffer = await file.arrayBuffer(); 
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0)); 
+        audioSampleRate = audioBuffer.sampleRate; audioChannels = audioBuffer.numberOfChannels;
+        logDebug(`Audio properties detected: Rate=${audioSampleRate}, Channels=${audioChannels}`);
+        await audioCtx.close(); 
+      } catch (e) {
+        logDebug(`Could not decode audio for properties: ${e.message}. Using defaults. File type: ${file.type}`, "warning");
+        if (file.type === "audio/wav" || file.name.toLowerCase().endsWith(".wav")) {
+            logDebug("File is WAV. Server will handle resampling if needed based on its default (16kHz).");
+        }
+      }
+
+      try {
+        if (currentWebSocket && currentWebSocket.readyState === WebSocket.OPEN) currentWebSocket.close();
+        
+        // Use WebSocket protocol matching the page protocol (ws:// or wss://)
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const wsUrl = `${wsProtocol}${window.location.host}/v1/audio/transcriptions/ws`;
+        currentWebSocket = new WebSocket(wsUrl);
+        
+        const socket = currentWebSocket; 
+        if (watchdogInterval) clearInterval(watchdogInterval);
+        watchdogInterval = setInterval(() => { /* ... (no change) ... */ 
+          if (uploadStreamCompleted && (Date.now() - lastMessageTime > 20000)) { 
+            updateStatus("No response from server for 20s. Processing might be slow or stalled.", "warning");
+            logDebug("Watchdog: Potential stall detected."); lastMessageTime = Date.now(); 
+          }
+        }, 10000); 
+
+        socket.onopen = async () => { /* ... (no change in onopen logic itself) ... */ 
+          updateStatus("WebSocket connected (Full Decode). Sending configuration...", "info");
+          logDebug("WebSocket (Full Decode) opened.");
+          socket.send(JSON.stringify({ 
+            sample_rate: audioSampleRate, channels: audioChannels, format: "binary" 
+          }));
+          logDebug(`Sent config (Full Decode): SR=${audioSampleRate}, CH=${audioChannels}`);
+          try {
+            await uploadFileInChunks(file, socket); 
+            logDebug("uploadFileInChunks (Full Decode) finished.");
+            if (socket.readyState === WebSocket.OPEN) {
+              updateStatus("File upload complete (Full Decode). Sending END signal...", "info");
+              socket.send("END"); uploadStreamCompleted = true; lastMessageTime = Date.now(); 
+              logDebug("END signal sent (Full Decode).");
+            }
+          } catch (uploadError) {
+            logDebug(`Upload failed (Full Decode): ${uploadError.message}`, uploadError);
+            updateStatus(`Upload error (Full Decode): ${uploadError.message}`, "warning");
+            if (socket.readyState === WebSocket.OPEN) socket.close();
+          }
+        };
+        
+        socket.onmessage = (event) => {
+          lastMessageTime = Date.now(); 
+          let msg;
+          try {
+            msg = JSON.parse(event.data); 
+            logDebug("WebSocket message received (Full Decode)", msg);
+
+            if (msg.type === "error") { /* ... (no change) ... */ 
+              updateStatus(`Server error (Full Decode): ${msg.error}`, "warning");
+              logDebug("Server-side error reported (Full Decode)", msg.error); socket.close(); return;
+            }
+            
+            if (msg.type === "final_transcription") {
+              // Total transcription time is from the server message
+              timeBox.textContent = `${msg.transcription_time || 'N/A'} seconds`;
+              // If no segments were received at all, timeToFirstSegment remains N/A or can be set to total.
+              // However, it should have been set when the first actual segment arrived.
+              if (!firstSegmentReceived && msg.total_segments > 0) { 
+                  // This case implies final message arrived before any segment,
+                  // or segments had no text. Set it to total time.
+                  const fallbackTimeToFirst = ((performance.now() - transcriptionStartTime) / 1000).toFixed(2);
+                  timeToFirstSegmentBox.textContent = `${fallbackTimeToFirst} seconds (final only)`;
+              } else if (!firstSegmentReceived && msg.total_segments === 0) {
+                  timeToFirstSegmentBox.textContent = "N/A (no segments)";
+              }
+
+
+              resultBox.textContent = msg.text || "No final transcription text.";
+              progressBar.style.display = "none";
+              const expectedSegments = msg.total_segments || 0;
+              if (expectedSegments > receivedSegmentsCount) { /* ... (no change) ... */ 
+                updateStatus(`Transcription complete (Full Decode)! Received ${receivedSegmentsCount}/${expectedSegments} segments. Final duration: ${msg.final_duration_processed_seconds}s.`, "warning");
+              } else { /* ... (no change) ... */ 
+                updateStatus(`Transcription complete (Full Decode)! ${receivedSegmentsCount} segments processed. Final duration: ${msg.final_duration_processed_seconds}s.`, "success");
+              }
+              if (watchdogInterval) clearInterval(watchdogInterval); 
+              socket.close(); 
+            } else if (msg.text !== undefined && msg.start !== undefined) { // This is a segment message
+              if (!firstSegmentReceived) {
+                const firstSegmentTime = performance.now();
+                const durationToFirstSegment = ((firstSegmentTime - transcriptionStartTime) / 1000).toFixed(2);
+                timeToFirstSegmentBox.textContent = `${durationToFirstSegment} seconds`;
+                firstSegmentReceived = true;
+              }
+              
+              receivedSegmentsCount++;
+              updateStatus(`Processing (Full Decode): Received segment ${receivedSegmentsCount}`, "info");
+              if (segmentsBox.innerHTML === "No segments received yet.") {
+                segmentsBox.innerHTML = ""; 
+                resultBox.textContent = "Transcribing... (receiving segments)";
+              }
+              const el = document.createElement("div"); el.className = "segment";
+              el.textContent = `[${msg.start.toFixed(2)}s - ${msg.end.toFixed(2)}s] ${msg.text}`;
+              segmentsBox.appendChild(el); segmentsBox.scrollTop = segmentsBox.scrollHeight; 
+            } else { logDebug("Received unhandled message structure (Full Decode)", msg); }
+          } catch (err) { /* ... (no change) ... */ 
+            updateStatus(`Error parsing server JSON response (Full Decode): ${err.message}`, "warning");
+            logDebug("JSON Parse error (Full Decode)", {error: err.message, data: event.data});
+          }
+        };
+
+        socket.onerror = (error) => { /* ... (no change) ... */ 
+          logDebug("WebSocket error (Full Decode)", error);
+          updateStatus("WebSocket error (Full Decode). Check console and server logs.", "warning");
+          progressBar.style.display = "none"; if (watchdogInterval) clearInterval(watchdogInterval);
+          transcribeButton.disabled = false;
+        };
+        socket.onclose = (event) => { /* ... (no change) ... */ 
+          logDebug("WebSocket closed (Full Decode)", {code: event.code, reason: event.reason, wasClean: event.wasClean});
+          if (uploadStreamCompleted && !resultBox.textContent.includes("Transcription complete")) {
+             updateStatus(`Connection closed (Full Decode) (Code: ${event.code}). Transcription might be incomplete.`, event.wasClean ? "info" : "warning");
+          } else if (!uploadStreamCompleted && event.code !== 1000 ) {
+             updateStatus(`Connection closed prematurely (Full Decode) (Code: ${event.code}).`, "warning");
+          }
+          progressBar.style.display = "none"; if (watchdogInterval) clearInterval(watchdogInterval);
+          transcribeButton.disabled = false; currentWebSocket = null;
+        };
+        
+      } catch (err) { /* ... (no change) ... */ 
+        updateStatus(`Client-side WebSocket setup error (Full Decode): ${err.message}`, "warning");
+        logDebug("Outer WebSocket Error (Full Decode)", err);
+        progressBar.style.display = "none"; if (watchdogInterval) clearInterval(watchdogInterval);
+        transcribeButton.disabled = false;
+      }
+    }
+    
+    async function uploadFileInChunks(file, socket) { /* ... (no change) ... */ 
+        const fileSize = file.size; let offset = 0;
+        updateStatus(`Starting upload (Full File Mode): ${(fileSize / (1024 * 1024)).toFixed(2)}MB total`, "info");
+        logDebug(`uploadFileInChunks (Full File Mode): Starting for ${file.name}, size ${fileSize}`);
+        if (!file.stream) {
+            const errorMsg = "File streaming (file.stream()) is not supported. Cannot upload.";
+            logDebug(errorMsg, "error"); updateStatus(errorMsg, "warning"); throw new Error(errorMsg);
+        }
+        const reader = file.stream().getReader(); let lastProgressUpdate = 0;
+        try {
+            while (offset < fileSize) {
+                if (socket.readyState !== WebSocket.OPEN) {
+                    logDebug("WS closed during upload (Full File Mode).", "warning");
+                    throw new Error("WS connection closed during upload (Full File Mode).");
+                }
+                const { done, value } = await reader.read();
+                if (done) { logDebug("File stream read complete (Full File Mode)."); break; }
+                if (value) {
+                    socket.send(value); offset += value.byteLength;
+                    const progress = Math.min(100, Math.round((offset / fileSize) * 100));
+                    progressBar.value = progress;
+                    if (progress > lastProgressUpdate || progress === 100) {
+                        updateStatus(`Uploading (Full File Mode): ${progress}%`, "info");
+                        lastProgressUpdate = progress;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 1));
+                } else if (!done) { logDebug("Reader no value but not done (Full File Mode).", "warning");}
+            }
+            if (offset < fileSize) {logDebug(`Upload ended prematurely (Full File Mode): ${offset}/${fileSize} bytes.`, "warning");}
+            else { logDebug("Full file content streamed for upload (Full File Mode).", "success"); }
+        } catch (error) {
+            logDebug(`Error during chunk upload (Full File Mode): ${error.message}`, error);
+            updateStatus(`Upload stream error (Full File Mode): ${error.message}`, "warning");
+            if (reader) await reader.releaseLock().catch(e => logDebug("Error releasing reader lock (Full File Mode)", e));
+            throw error; 
+        } finally {
+            if (reader && typeof reader.releaseLock === 'function') { 
+                try { await reader.releaseLock(); logDebug("File stream reader lock released (Full File Mode).");}
+                catch (e) { logDebug("Could not release reader lock (Full File Mode).", e);}
+            }
+        }
+    }
+    toggleDebug(); 
+  </script>
+</body>
+</html>
