@@ -20,13 +20,13 @@ A high-performance Automatic Speech Recognition (ASR) server built with NVIDIA's
 
 ## 🛠️ Installation
 
-### Using Docker (Recommended)
+### Using Docker (Recommended) (Mac/Linux/Windows)
 
 The easiest way to run Parakeet ASR is using Docker:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/parakeet-asr.git
+git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
 cd parakeet-asr
 
 # Build the Docker image
@@ -36,13 +36,13 @@ docker build -t parakeet-asr .
 docker run --gpus all -p 8777:8777 parakeet-asr
 ```
 
-### Manual Installation
+### Manual Installation (Mac/Linux)
 
 If you prefer to run without Docker:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/parakeet-asr.git
+git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
 cd parakeet-asr
 
 # Install dependencies
@@ -137,7 +137,7 @@ To set up a development environment:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/parakeet-asr.git
+git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
 cd parakeet-asr
 
 # Install dev dependencies
