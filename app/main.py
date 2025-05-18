@@ -5,7 +5,6 @@ import logging
 import os
 import shutil
 import tempfile
-import time
 
 import nemo.collections.asr as nemo_asr
 import torch
@@ -18,6 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketState
+
+# import time # No longer needed as timing logic has been removed/commented out
+
 
 load_dotenv()
 
@@ -334,7 +336,6 @@ async def transcribe_rest(file: UploadFile = File(...)):
         total_duration_seconds = waveform_full.shape[1] / MODEL_SAMPLE_RATE
 
         # 3. Process audio in chunks using a sliding window
-        start_time_processing = time.time()
         current_processing_time_seconds = 0.0  # Tracks the start of the main (non-overlapped) part of the current window
         all_segments = []
 
@@ -401,13 +402,45 @@ async def transcribe_rest(file: UploadFile = File(...)):
 
             current_processing_time_seconds += CHUNK_LENGTH - OVERLAP
 
-        transcription_duration_seconds = round(time.time() - start_time_processing, 3)
-        final_text = " ".join(s["text"] for s in all_segments).strip()
+        # transcription_duration_seconds = round(time.time() - start_time_processing, 3) # This was for internal timing, not part of the final user-facing struct
+
+        # Consolidate all word segments from all_segments into a single list
+        all_word_segments_for_response = []
+        for seg in all_segments:
+            # The 'words' in seg are already in the correct WordSegment format
+            # We need to ensure they are added to the flat list word_segments
+            # The 'id' in the original all_segments was for OpenAI compatibility and is not needed here.
+            # The 'seg' itself will go into the nested 'segments' list.
+            all_word_segments_for_response.extend(seg.get("words", []))
+
+        # Prepare the final segments list for the response (without the 'id' or other OpenAI specific fields)
+        final_segments_for_response = []
+        for seg in all_segments:
+            final_segments_for_response.append(
+                {
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": seg["text"],
+                    "words": seg.get(
+                        "words", []
+                    ),  # Keep words within each segment as per Rust struct
+                }
+            )
+
+        final_text = " ".join(s["text"] for s in final_segments_for_response).strip()
+
         result = {
+            "task": "transcribe",  # Added task field
+            "language": "en",  # Assuming English, can be made dynamic if needed
+            "duration": round(
+                total_duration_seconds, 3
+            ),  # Added duration of the original audio
             "text": final_text,
-            "segments": all_segments,
-            "language": "en",
-            "transcription_time": transcription_duration_seconds,
+            "segments": {  # Nested segments structure
+                "segments": final_segments_for_response,
+                "word_segments": all_word_segments_for_response,
+            },
+            # "transcription_time": transcription_duration_seconds # This was for internal timing, user requested structure doesn't include it directly
         }
         return JSONResponse(content=result)
 
@@ -526,7 +559,6 @@ async def websocket_transcribe(websocket: WebSocket):
 
         # --- Start of full audio processing logic (after all bytes received) ---
         logger.info("WebSocket (/ws): Starting full audio processing.")
-        processing_start_time = time.time()
         all_segments_sent_to_client = []  # Tracks segments sent for final summary
 
         try:
@@ -652,20 +684,43 @@ async def websocket_transcribe(websocket: WebSocket):
 
             # 6. Send final transcription summary if still connected
             if websocket.application_state == WebSocketState.CONNECTED:
+
+                # Consolidate all word segments for the WebSocket response
+                all_word_segments_for_ws_response = []
+                for seg_data in all_segments_sent_to_client:
+                    # Assuming seg_data from run_asr_on_tensor_chunk now contains 'words'
+                    all_word_segments_for_ws_response.extend(seg_data.get("words", []))
+
+                # Prepare the final segments list for the WebSocket response
+                final_segments_for_ws_response = []
+                for seg_data in all_segments_sent_to_client:
+                    final_segments_for_ws_response.append(
+                        {
+                            "start": seg_data["start"],
+                            "end": seg_data["end"],
+                            "text": seg_data["text"],
+                            "words": seg_data.get(
+                                "words", []
+                            ),  # Keep words within each segment
+                        }
+                    )
+
                 final_transcription_text = " ".join(
-                    s["text"] for s in all_segments_sent_to_client
+                    s["text"] for s in final_segments_for_ws_response
                 ).strip()
-                transcription_duration = round(time.time() - processing_start_time, 3)
+                # transcription_duration_wall_time = round(time.time() - processing_start_time, 3) # This was for internal timing, not part of the final user-facing struct
+
                 await websocket.send_json(
                     {
+                        "task": "transcribe",
+                        "language": "en",
+                        "duration": round(total_audio_duration_seconds, 3),
                         "text": final_transcription_text,
-                        "language": "en",  # Placeholder
-                        "transcription_time": transcription_duration,
-                        "total_segments": len(all_segments_sent_to_client),
-                        "final_duration_processed_seconds": round(
-                            total_audio_duration_seconds, 3
-                        ),
-                        "type": "final_transcription",
+                        "segments": {
+                            "segments": final_segments_for_ws_response,
+                            "word_segments": all_word_segments_for_ws_response,
+                        },
+                        "type": "final_transcription",  # Keep type for client differentiation
                     }
                 )
             logger.info("WebSocket (/ws): All processing complete.")
