@@ -174,16 +174,6 @@ def run_asr_on_tensor_chunk(
 
         hypothesis = output_hypotheses[0]
 
-        # ====== 新增日志，排查 word_timestamps 问题 ======
-        if hasattr(hypothesis, "word_timestamps"):
-            logger.info(
-                f"hypothesis.word_timestamps 存在，长度: {len(hypothesis.word_timestamps) if hypothesis.word_timestamps else 0}"
-            )
-            logger.debug(f"word_timestamps 内容: {hypothesis.word_timestamps}")
-        else:
-            logger.warning("hypothesis.word_timestamps 不存在！")
-        # ====== 新增日志结束 ======
-
         # Extract the full text for this chunk if available.
         if hasattr(hypothesis, "text") and hypothesis.text:
             transcribed_text = hypothesis.text.strip()
@@ -232,34 +222,20 @@ def run_asr_on_tensor_chunk(
 
                 for word_detail in word_timestamps_for_chunk:
                     word_text = word_detail.get("word")
-                    relative_word_start = word_detail.get("start_offset")
-                    relative_word_end = word_detail.get("end_offset")
-                    word_score = float(
-                        word_detail.get("score", 0.0)
-                    )  # Default score to 0.0
+                    word_start = word_detail.get("start")  # 直接用 start 字段，单位秒
+                    word_end = word_detail.get("end")  # 直接用 end 字段，单位秒
+                    word_score = float(word_detail.get("score", 0.0))
 
-                    if (
-                        word_text
-                        and relative_word_start is not None
-                        and relative_word_end is not None
-                    ):
-                        # Assign word to segment if the word starts within this segment's timeframe
+                    if word_text and word_start is not None and word_end is not None:
+                        # 只要词的起始时间在当前分段内，就分配给该分段
                         if (
-                            relative_word_start >= relative_seg_start
-                            and relative_word_start < relative_seg_end
+                            word_start >= abs_seg_start_time
+                            and word_start < abs_seg_end_time
                         ):
-                            abs_word_start = round(
-                                relative_word_start + chunk_time_offset, 3
-                            )
-                            abs_word_end = round(
-                                relative_word_end + chunk_time_offset, 3
-                            )
-
-                            abs_word_end = min(
-                                abs_word_end, abs_seg_end_time
-                            )  # Clip word end to segment end
-
-                            if abs_word_start < abs_word_end:  # Ensure valid duration
+                            abs_word_start = round(word_start, 3)
+                            abs_word_end = round(word_end, 3)
+                            abs_word_end = min(abs_word_end, abs_seg_end_time)
+                            if abs_word_start < abs_word_end:
                                 current_segment_word_list.append(
                                     {
                                         "start": abs_word_start,
@@ -422,6 +398,7 @@ async def transcribe_rest(file: UploadFile = File(...)):
                             "start": seg_meta["start"],
                             "end": seg_meta["end"],
                             "text": seg_meta["text"],
+                            "words": seg_meta.get("words", []),  # 保留词级别信息
                             # Placeholder fields:
                             "seek": 0,
                             "tokens": [],
