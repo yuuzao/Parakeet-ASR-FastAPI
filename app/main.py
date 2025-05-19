@@ -174,6 +174,16 @@ def run_asr_on_tensor_chunk(
 
         hypothesis = output_hypotheses[0]
 
+        # ====== 新增日志，排查 word_timestamps 问题 ======
+        if hasattr(hypothesis, "word_timestamps"):
+            logger.info(
+                f"hypothesis.word_timestamps 存在，长度: {len(hypothesis.word_timestamps) if hypothesis.word_timestamps else 0}"
+            )
+            logger.debug(f"word_timestamps 内容: {hypothesis.word_timestamps}")
+        else:
+            logger.warning("hypothesis.word_timestamps 不存在！")
+        # ====== 新增日志结束 ======
+
         # Extract the full text for this chunk if available.
         if hasattr(hypothesis, "text") and hypothesis.text:
             transcribed_text = hypothesis.text.strip()
