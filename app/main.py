@@ -18,6 +18,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketState
 
+from models import TranscriptionResponse, Word, Segment, Segments
+
 # import time # No longer needed as timing logic has been removed/commented out
 
 
@@ -113,7 +115,7 @@ except Exception as e:
 def run_asr_on_tensor_chunk(
     audio_chunk_tensor: torch.Tensor,  # Expected to be 1D, mono, at MODEL_SAMPLE_RATE
     chunk_time_offset: float,  # Absolute start time of this chunk in the original audio
-) -> tuple[list[dict], list[str]]:
+) -> tuple[list[Segment], list[str]]:
     """
     Transcribes a 1D audio tensor chunk and adjusts timestamps.
 
@@ -155,10 +157,8 @@ def run_asr_on_tensor_chunk(
             num_workers=NUM_WORKERS,
         )
 
-        processed_segments = []
-        chunk_full_text_parts = (
-            []
-        )  # This list will store the full text transcription parts for the chunk.
+        processed_segments: list[Segment] = []
+        chunk_full_text_parts: list[str] = []  # This list will store the full text transcription parts for the chunk.
 
         # `asr_model.transcribe` with batch_size=1 and return_hypotheses=True
         # is expected to return a list containing exactly one Hypothesis object.
@@ -187,7 +187,17 @@ def run_asr_on_tensor_chunk(
             and hypothesis.timestamp
             and "word" in hypothesis.timestamp
         ):
-            word_timestamps_for_chunk = hypothesis.timestamp["word"]
+            word_timestamps_for_chunk = []
+            for word_meta in hypothesis.timestamp["word"]:
+                word = Word(
+                    word=word_meta.get("word", ""),
+                    start=word_meta.get("start") + chunk_time_offset,
+                    end=word_meta.get("end") + chunk_time_offset,
+                    start_offset=word_meta.get("start_offset"),
+                    end_offset=word_meta.get("end_offset"),
+                )
+                word_timestamps_for_chunk.append(word)
+            word_timestamps_for_chunk.sort(key=lambda x: x.start_offset)
             logger.info(
                 f"使用 hypothesis.timestamp['word']，长度: {len(word_timestamps_for_chunk)}"
             )
@@ -197,93 +207,25 @@ def run_asr_on_tensor_chunk(
 
         # Extract segment-level timestamps if available.
         if hasattr(hypothesis, "timestamp") and hypothesis.timestamp:
-            segment_metadata_list = hypothesis.timestamp.get("segment", [])
+            segment_metadata_list: list[Segment] = []
+            for seg_meta in hypothesis.timestamp.get("segment", []):
+                seg = Segment(
+                    start=seg_meta.get("start") + chunk_time_offset,
+                    end=seg_meta.get("end") + chunk_time_offset,
+                    start_offset=seg_meta.get("start_offset"),
+                    end_offset=seg_meta.get("end_offset"),
+                    text=seg_meta.get("segment", "").strip(),
+                    words=[]
+                )
+                segment_metadata_list.append(seg)
+                segment_metadata_list.sort(key=lambda x: x.start_offset)
 
             for seg_meta in segment_metadata_list:
-                # Get segment text from NeMo, can be empty
-                seg_text_from_model = seg_meta.get("segment", "").strip()
+                for word in word_timestamps_for_chunk:
+                    if word.start >= seg_meta.start and word.end <= seg_meta.end:
+                        seg_meta.words.append(word)
 
-                relative_seg_start = seg_meta.get("start")
-                relative_seg_end = seg_meta.get("end")
-
-                if relative_seg_start is None or relative_seg_end is None:
-                    logger.warning(
-                        f"Segment missing start or end time, skipping: {seg_meta}"
-                    )
-                    continue
-
-                abs_seg_start_time = round(relative_seg_start + chunk_time_offset, 3)
-                abs_seg_end_time = round(relative_seg_end + chunk_time_offset, 3)
-
-                current_segment_word_list = []
-                actual_words_in_segment_text_parts = (
-                    []
-                )  # To reconstruct segment text if needed
-
-                for word_detail in word_timestamps_for_chunk:
-                    word_text = word_detail.get("word")
-                    word_start = word_detail.get("start")  # 直接用 start 字段，单位秒
-                    word_end = word_detail.get("end")  # 直接用 end 字段，单位秒
-                    word_score = float(word_detail.get("score", 0.0))
-
-                    if word_text and word_start is not None and word_end is not None:
-                        # 只要词的起始时间在当前分段内，就分配给该分段
-                        if (
-                            word_start >= abs_seg_start_time
-                            and word_start < abs_seg_end_time
-                        ):
-                            abs_word_start = round(word_start, 3)
-                            abs_word_end = round(word_end, 3)
-                            abs_word_end = min(abs_word_end, abs_seg_end_time)
-                            if abs_word_start < abs_word_end:
-                                current_segment_word_list.append(
-                                    {
-                                        "start": abs_word_start,
-                                        "end": abs_word_end,
-                                        "word": word_text,
-                                        "score": word_score,
-                                    }
-                                )
-                                actual_words_in_segment_text_parts.append(word_text)
-
-                # Determine the final text for the segment
-                final_segment_text = seg_text_from_model
-                if (
-                    not final_segment_text.strip()
-                    and actual_words_in_segment_text_parts
-                ):
-                    final_segment_text = " ".join(actual_words_in_segment_text_parts)
-
-                # ====== 新增日志：排查 words 为空的情况 ======
-                if not current_segment_word_list and final_segment_text.strip():
-                    logger.warning(f"Segment with text has empty words list!")
-                    logger.warning(
-                        f"  Segment Start: {abs_seg_start_time}, End: {abs_seg_end_time}, Text: '{final_segment_text.strip()}'"
-                    )
-                    logger.warning(
-                        f"  Word timestamps for this chunk at this point ({len(word_timestamps_for_chunk)} words):"
-                    )
-                    for i, wd_chk in enumerate(word_timestamps_for_chunk):
-                        logger.warning(
-                            f"    Chunk Word {i}: Start={wd_chk.get('start')}, End={wd_chk.get('end')}, Word='{wd_chk.get('word')}'"
-                        )
-                        if (
-                            i > 10 and len(word_timestamps_for_chunk) > 20
-                        ):  # 避免日志过长，只显示部分
-                            logger.warning(
-                                f"    ... (and {len(word_timestamps_for_chunk) - i - 1} more words in chunk) ..."
-                            )  # Ensure spaces around - 1
-                            break
-                # ====== 新增日志结束 ======
-
-                processed_segments.append(
-                    {
-                        "start": abs_seg_start_time,
-                        "end": abs_seg_end_time,
-                        "text": final_segment_text.strip(),  # Ensure stripped text
-                        "words": current_segment_word_list,
-                    }
-                )
+                processed_segments.append(seg_meta)
 
         return processed_segments, chunk_full_text_parts  # Return chunk_full_text_parts
 
@@ -298,7 +240,7 @@ def run_asr_on_tensor_chunk(
         return [], []
 
 
-@app.post("/v1/audio/transcriptions")
+@app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
 async def transcribe_rest(file: UploadFile = File(...)):
     """
     Handles audio transcription via REST API.
@@ -367,9 +309,7 @@ async def transcribe_rest(file: UploadFile = File(...)):
 
         # 3. Process audio in chunks using a sliding window
         current_processing_time_seconds = 0.0  # Tracks the start of the main (non-overlapped) part of the current window
-        all_segments = []
-
-        # The loop continues as long as there's a new main window to process.
+        all_segments: list[Segment] = []
         while current_processing_time_seconds < total_duration_seconds:
             # Define the actual audio slice considering overlap.
             # `actual_chunk_start_seconds` can go before `current_processing_time_seconds` due to overlap.
@@ -402,63 +342,18 @@ async def transcribe_rest(file: UploadFile = File(...)):
             segments_from_chunk, _ = await asyncio.to_thread(
                 run_asr_on_tensor_chunk, audio_chunk_for_asr, actual_chunk_start_seconds
             )
-
-            # Process the transcription output for this chunk
-            for (
-                seg_meta
-            ) in (
-                segments_from_chunk
-            ):  # segments_from_chunk already contains dicts with absolute times
-                # Filtering logic (same as before)
-                if (
-                    seg_meta["start"] >= current_processing_time_seconds
-                    or not all_segments
-                ):
-                    all_segments.append(
-                        {
-                            "id": len(all_segments),
-                            "start": seg_meta["start"],
-                            "end": seg_meta["end"],
-                            "text": seg_meta["text"],
-                            "words": seg_meta.get("words", []),  # 保留词级别信息
-                            # Placeholder fields:
-                            "seek": 0,
-                            "tokens": [],
-                            "temperature": 0.0,
-                            "avg_logprob": None,
-                            "compression_ratio": None,
-                            "no_speech_prob": None,
-                        }
-                    )
+            all_segments.extend(segments_from_chunk)
 
             current_processing_time_seconds += CHUNK_LENGTH - OVERLAP
-
-        # transcription_duration_seconds = round(time.time() - start_time_processing, 3) # This was for internal timing, not part of the final user-facing struct
 
         # Consolidate all word segments from all_segments into a single list
         all_word_segments_for_response = []
         for seg in all_segments:
-            # The 'words' in seg are already in the correct WordSegment format
-            # We need to ensure they are added to the flat list word_segments
-            # The 'id' in the original all_segments was for OpenAI compatibility and is not needed here.
-            # The 'seg' itself will go into the nested 'segments' list.
-            all_word_segments_for_response.extend(seg.get("words", []))
+            all_word_segments_for_response.extend(seg.words)
 
-        # Prepare the final segments list for the response (without the 'id' or other OpenAI specific fields)
-        final_segments_for_response = []
-        for seg in all_segments:
-            final_segments_for_response.append(
-                {
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "text": seg["text"],
-                    "words": seg.get(
-                        "words", []
-                    ),  # Keep words within each segment as per Rust struct
-                }
-            )
+        final_text = " ".join(s.text for s in all_segments).strip()
 
-        final_text = " ".join(s["text"] for s in final_segments_for_response).strip()
+        segments = Segments(segments=all_segments, word_segments=all_word_segments_for_response)
 
         result = {
             "task": "transcribe",  # Added task field
@@ -467,13 +362,10 @@ async def transcribe_rest(file: UploadFile = File(...)):
                 total_duration_seconds, 3
             ),  # Added duration of the original audio
             "text": final_text,
-            "segments": {  # Nested segments structure
-                "segments": final_segments_for_response,
-                "word_segments": all_word_segments_for_response,
-            },
-            # "transcription_time": transcription_duration_seconds # This was for internal timing, user requested structure doesn't include it directly
+            "segments": segments,
         }
-        return JSONResponse(content=result)
+        transcription_response = TranscriptionResponse(**result)
+        return transcription_response
 
     except Exception as e:
         logger.error(f"transcribe_rest: Unhandled exception: {str(e)}")
@@ -491,298 +383,6 @@ async def transcribe_rest(file: UploadFile = File(...)):
             os.remove(
                 uploaded_full_temp_file_path
             )  # Delete the initially uploaded full temp file
-
-
-@app.websocket("/v1/audio/transcriptions/ws")
-async def websocket_transcribe(websocket: WebSocket):
-    """
-    Handles audio transcription via WebSocket.
-    The client streams the entire audio file. The server accumulates all data,
-    decodes the full audio, then processes it in chunks with overlap
-    (similar to the REST endpoint's logic) by calling `run_asr_on_tensor_chunk`.
-    """
-    await websocket.accept()
-    if not asr_model:  # Global asr_model
-        logger.error("websocket_transcribe: ASR model not available.")
-        await websocket.send_json({"error": "ASR model not available."})
-        await websocket.close(code=1011)
-        return
-
-    main_audio_buffer = bytearray()  # Buffer for raw file bytes from client
-    client_config = {}  # For storing client-sent metadata (e.g., original format)
-
-    is_connected = True  # Flag to control the receiving loop
-    try:
-        # 1. Receive client configuration (optional, primarily for logging)
-        try:
-            config_message = await asyncio.wait_for(
-                websocket.receive_json(), timeout=10.0
-            )
-            client_config.update(config_message)
-            logger.info(f"WebSocket (/ws) client reported config: {client_config}")
-        except asyncio.TimeoutError:
-            logger.info("WebSocket (/ws): Client configuration timeout. Proceeding.")
-        except Exception as e:
-            logger.info(
-                f"WebSocket (/ws): Error receiving client configuration: {e}. Proceeding."
-            )
-
-        # 2. Accumulate all audio file bytes from the client stream
-        logger.info("WebSocket (/ws): Waiting for audio data stream from client...")
-        while is_connected:
-            try:
-                if websocket.application_state != WebSocketState.CONNECTED:
-                    is_connected = False
-                    break
-
-                message = await asyncio.wait_for(
-                    websocket.receive(), timeout=60.0
-                )  # Timeout for individual messages
-
-                if "bytes" in message:
-                    main_audio_buffer.extend(message["bytes"])
-                elif "text" in message:
-                    if (
-                        client_config.get("format") == "base64"
-                    ):  # Handle base64 if client specifies
-                        try:
-                            main_audio_buffer.extend(base64.b64decode(message["text"]))
-                        except Exception as b64e:
-                            logger.warning(
-                                f"WebSocket (/ws): Base64 decode error: {b64e}"
-                            )
-                            # Decide if this is a fatal error or if we should continue
-                    elif message["text"].upper() == "END":
-                        logger.info(
-                            f"WebSocket (/ws): END signal received. Total bytes: {len(main_audio_buffer)}"
-                        )
-                        is_connected = False  # Signal to stop receiving
-                        break
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "WebSocket (/ws): Timeout waiting for message. Assuming stream ended or client stalled."
-                )
-                is_connected = False  # Stop receiving
-                break
-            except WebSocketDisconnect:
-                logger.info(
-                    "WebSocket (/ws): Client disconnected during data accumulation."
-                )
-                is_connected = False  # Stop receiving
-                break
-            except Exception as e:
-                logger.error(f"WebSocket (/ws): Exception in receive loop: {str(e)}")
-                import traceback
-
-                traceback.print_exc()
-                is_connected = False  # Stop receiving
-                break
-
-        if not main_audio_buffer:
-            logger.info("WebSocket (/ws): No audio data received.")
-            if (
-                websocket.application_state == WebSocketState.CONNECTED
-            ):  # Check before sending
-                await websocket.send_json(
-                    {"error": "No audio data received", "type": "error"}
-                )
-            return
-
-        # --- Start of full audio processing logic (after all bytes received) ---
-        logger.info("WebSocket (/ws): Starting full audio processing.")
-        all_segments_sent_to_client = []  # Tracks segments sent for final summary
-
-        try:
-            # 3. Decode the entire accumulated audio stream
-            audio_io_buffer = io.BytesIO(main_audio_buffer)
-            full_waveform, sr_original = torchaudio.load(audio_io_buffer)
-            main_audio_buffer.clear()  # Release memory as soon as possible
-            logger.info(
-                f"WebSocket (/ws): Audio decoded. Original SR={sr_original}, Shape={full_waveform.shape}"
-            )
-
-            # 4. Preprocess: Resample to model's sample rate and convert to mono
-            if sr_original != MODEL_SAMPLE_RATE:
-                full_waveform = torchaudio.functional.resample(
-                    full_waveform, orig_freq=sr_original, new_freq=MODEL_SAMPLE_RATE
-                )
-
-            if full_waveform.ndim > 1 and full_waveform.shape[0] > 1:  # Multichannel
-                full_waveform = full_waveform.mean(dim=0)  # Convert to mono [Time]
-            elif (
-                full_waveform.ndim == 2 and full_waveform.shape[0] == 1
-            ):  # Already mono [1, Time]
-                full_waveform = full_waveform.squeeze(0)  # Make it 1D [Time]
-            # Now, full_waveform is expected to be a 1D tensor [Time]
-
-            if full_waveform.numel() == 0:
-                logger.info(
-                    "WebSocket (/ws): Audio content is empty after decoding/preprocessing."
-                )
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    await websocket.send_json(
-                        {
-                            "text": "",
-                            "segments": [],
-                            "language": "en",
-                            "transcription_time": 0.0,
-                            "total_segments": 0,
-                            "final_duration_processed_seconds": 0.0,
-                            "type": "final_transcription",
-                        }
-                    )
-                return
-
-            total_audio_duration_seconds = full_waveform.shape[0] / MODEL_SAMPLE_RATE
-            current_processing_window_start_seconds = (
-                0.0  # Start of the main (non-overlapped) part of the window
-            )
-
-            logger.info(
-                f"WebSocket (/ws): Server-side chunking. Total Duration: {total_audio_duration_seconds:.2f}s. ChunkLen: {CHUNK_LENGTH}s, Overlap: {OVERLAP}s"
-            )
-
-            # 5. Process audio in chunks using a sliding window
-            while (
-                current_processing_window_start_seconds < total_audio_duration_seconds
-            ):
-                if websocket.application_state != WebSocketState.CONNECTED:
-                    logger.info(
-                        "WebSocket (/ws): Client disconnected during chunk processing."
-                    )
-                    break
-
-                # Calculate the actual slice for ASR, including overlap
-                # CHUNK_LENGTH and OVERLAP are from your global environment variables
-                actual_asr_chunk_start_seconds = max(
-                    0, current_processing_window_start_seconds - OVERLAP
-                )
-                actual_asr_chunk_end_seconds = min(
-                    total_audio_duration_seconds,
-                    current_processing_window_start_seconds + CHUNK_LENGTH,
-                )
-
-                start_sample_idx = int(
-                    actual_asr_chunk_start_seconds * MODEL_SAMPLE_RATE
-                )
-                end_sample_idx = int(actual_asr_chunk_end_seconds * MODEL_SAMPLE_RATE)
-
-                if (
-                    start_sample_idx >= end_sample_idx
-                ):  # Should only happen if window is past audio end
-                    break
-
-                # Extract 1D tensor chunk for ASR
-                audio_chunk_for_asr = full_waveform[start_sample_idx:end_sample_idx]
-
-                if (
-                    audio_chunk_for_asr.numel() == 0
-                ):  # Skip if somehow the chunk is empty
-                    current_processing_window_start_seconds += CHUNK_LENGTH - OVERLAP
-                    continue  # Advance window and re-evaluate loop condition
-
-                # Call the ASR function for this chunk
-                # `run_asr_on_tensor_chunk` expects a 1D tensor and its absolute start time
-                segments_from_chunk, _ = await asyncio.to_thread(
-                    run_asr_on_tensor_chunk,
-                    audio_chunk_for_asr,
-                    actual_asr_chunk_start_seconds,
-                )
-
-                # Send processed segments to client, applying filtering logic
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    for segment_data in segments_from_chunk:
-                        # Filter: Send segment if its start time is within or after the current main window,
-                        # or if it's the first segment overall (to capture audio at the very beginning).
-                        if (
-                            segment_data["start"]
-                            >= current_processing_window_start_seconds
-                            or not all_segments_sent_to_client
-                        ):
-                            segment_data["id"] = len(
-                                all_segments_sent_to_client
-                            )  # Assign sequential ID
-                            await websocket.send_json(segment_data)
-                            all_segments_sent_to_client.append(segment_data)
-                else:
-                    logger.info(
-                        "WebSocket (/ws): Client disconnected while sending segments."
-                    )
-                    break
-
-                # Advance the main processing window
-                current_processing_window_start_seconds += CHUNK_LENGTH - OVERLAP
-
-            # 6. Send final transcription summary if still connected
-            if websocket.application_state == WebSocketState.CONNECTED:
-
-                # Consolidate all word segments for the WebSocket response
-                all_word_segments_for_ws_response = []
-                for seg_data in all_segments_sent_to_client:
-                    # Assuming seg_data from run_asr_on_tensor_chunk now contains 'words'
-                    all_word_segments_for_ws_response.extend(seg_data.get("words", []))
-
-                # Prepare the final segments list for the WebSocket response
-                final_segments_for_ws_response = []
-                for seg_data in all_segments_sent_to_client:
-                    final_segments_for_ws_response.append(
-                        {
-                            "start": seg_data["start"],
-                            "end": seg_data["end"],
-                            "text": seg_data["text"],
-                            "words": seg_data.get(
-                                "words", []
-                            ),  # Keep words within each segment
-                        }
-                    )
-
-                final_transcription_text = " ".join(
-                    s["text"] for s in final_segments_for_ws_response
-                ).strip()
-                # transcription_duration_wall_time = round(time.time() - processing_start_time, 3) # This was for internal timing, not part of the final user-facing struct
-
-                await websocket.send_json(
-                    {
-                        "task": "transcribe",
-                        "language": "en",
-                        "duration": round(total_audio_duration_seconds, 3),
-                        "text": final_transcription_text,
-                        "segments": {
-                            "segments": final_segments_for_ws_response,
-                            "word_segments": all_word_segments_for_ws_response,
-                        },
-                        "type": "final_transcription",  # Keep type for client differentiation
-                    }
-                )
-            logger.info("WebSocket (/ws): All processing complete.")
-
-        except Exception as audio_processing_error:
-            logger.error(
-                f"WebSocket (/ws): Error during audio processing phase: {audio_processing_error}"
-            )
-            import traceback
-
-            traceback.print_exc()
-            if websocket.application_state == WebSocketState.CONNECTED:
-                await websocket.send_json(
-                    {
-                        "error": f"Audio processing error: {audio_processing_error}",
-                        "type": "error",
-                    }
-                )
-
-    except Exception as outer_exception:  # Catch any other unforeseen errors
-        logger.error(
-            f"WebSocket (/ws): Unhandled exception in handler: {str(outer_exception)}"
-        )
-        import traceback
-
-        traceback.print_exc()
-    finally:
-        # Ensure WebSocket is closed from server-side if still open
-        if websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.close()
-        logger.info("WebSocket (/ws) handler finished.")
 
 
 if __name__ == "__main__":
