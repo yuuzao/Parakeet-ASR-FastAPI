@@ -192,9 +192,27 @@ def run_asr_on_tensor_chunk(
 
         # Attempt to get word-level timestamps for the entire chunk
         word_timestamps_for_chunk = []
-        if hasattr(hypothesis, "word_timestamps") and hypothesis.word_timestamps:
-            # Assuming hypothesis.word_timestamps is a list of dicts: [{'word': str, 'start_offset': float, 'end_offset': float}, ...]
+        # 优先从 hypothesis.timestep['word'] 获取
+        if (
+            hasattr(hypothesis, "timestep")
+            and hypothesis.timestep
+            and "word" in hypothesis.timestep
+        ):
+            word_timestamps_for_chunk = hypothesis.timestep["word"]
+            logger.info(
+                f"使用 hypothesis.timestep['word']，长度: {len(word_timestamps_for_chunk)}"
+            )
+            logger.debug(f"timestep['word'] 内容: {word_timestamps_for_chunk}")
+        elif hasattr(hypothesis, "word_timestamps") and hypothesis.word_timestamps:
             word_timestamps_for_chunk = hypothesis.word_timestamps
+            logger.info(
+                f"使用 hypothesis.word_timestamps，长度: {len(word_timestamps_for_chunk)}"
+            )
+            logger.debug(f"word_timestamps 内容: {word_timestamps_for_chunk}")
+        else:
+            logger.warning(
+                "没有找到词级别时间戳（word_timestamps 或 timestep['word']）！"
+            )
 
         # Extract segment-level timestamps if available.
         if hasattr(hypothesis, "timestamp") and hypothesis.timestamp:
