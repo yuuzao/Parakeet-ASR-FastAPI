@@ -88,6 +88,19 @@ try:
         model_name="nvidia/parakeet-tdt-0.6b-v2"
     )
     asr_model.preprocessor.featurizer.dither = 0.0
+    # ====== 新增：启用词级别时间戳 ======
+    try:
+        from omegaconf import open_dict
+
+        decoding_cfg = asr_model.cfg.decoding
+        with open_dict(decoding_cfg):
+            decoding_cfg.preserve_alignments = True
+            decoding_cfg.compute_timestamps = True
+        asr_model.change_decoding_strategy(decoding_cfg)
+        logger.info("ASR model decoding config updated: word timestamps enabled.")
+    except Exception as e:
+        logger.warning(f"Failed to set word timestamp config: {e}")
+    # ====== 新增结束 ======
     logger.info("ASR model loaded successfully.")
 except Exception as e:
     logger.critical(f"FATAL: Could not load ASR model. Error: {e}")
