@@ -254,6 +254,28 @@ def run_asr_on_tensor_chunk(
                 ):
                     final_segment_text = " ".join(actual_words_in_segment_text_parts)
 
+                # ====== 新增日志：排查 words 为空的情况 ======
+                if not current_segment_word_list and final_segment_text.strip():
+                    logger.warning(f"Segment with text has empty words list!")
+                    logger.warning(
+                        f"  Segment Start: {abs_seg_start_time}, End: {abs_seg_end_time}, Text: '{final_segment_text.strip()}'"
+                    )
+                    logger.warning(
+                        f"  Word timestamps for this chunk at this point ({len(word_timestamps_for_chunk)} words):"
+                    )
+                    for i, wd_chk in enumerate(word_timestamps_for_chunk):
+                        logger.warning(
+                            f"    Chunk Word {i}: Start={wd_chk.get('start')}, End={wd_chk.get('end')}, Word='{wd_chk.get('word')}'"
+                        )
+                        if (
+                            i > 10 and len(word_timestamps_for_chunk) > 20
+                        ):  # 避免日志过长，只显示部分
+                            logger.warning(
+                                f"    ... (and {len(word_timestamps_for_chunk) - i - 1} more words in chunk) ..."
+                            )  # Ensure spaces around - 1
+                            break
+                # ====== 新增日志结束 ======
+
                 processed_segments.append(
                     {
                         "start": abs_seg_start_time,
